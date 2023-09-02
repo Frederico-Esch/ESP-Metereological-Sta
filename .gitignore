@@ -1,0 +1,7 @@
+.pio
+.vscode
+.cache
+.ccls
+compile_commands.json
+backup.c
+old
