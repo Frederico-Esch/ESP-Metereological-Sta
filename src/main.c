@@ -14,11 +14,14 @@
 #include <sys/select.h>
 #include <unistd.h>
 
+#include "client_handle.h"
+
 #define SSID_MY_NETWORK "FRED_LUCAS"
 #define LEN_SSID_MY_NETWORK strlen(SSID_MY_NETWORK)
 #define PASS_MY_NETWORK "fred22458811278200"
 #define SERVER_KEY "Teste"
 #define SERVER_PING "PING-SERVER"
+#define SERVER_ADDR "192.168.2.101"
 #define WIFI_CONNECTED_BIT BIT0
 #define MSG_BUFFER_SIZE 100
 #define BUTTON_PIN GPIO_NUM_4
@@ -27,9 +30,8 @@ TaskHandle_t server_running;
 wifi_ap_record_t target_acess_point = {0};
 esp_netif_t* my_netif = NULL;
 esp_event_handler_instance_t got_my_ip_instance;
-esp_event_handler_instance_t try_reconnect_instance;
 esp_event_handler_instance_t started_wifi_sta_instance;
-esp_event_handler_instance_t connected_wifi_sta_instance;
+TaskHandle_t client_run_handle;
 volatile bool connect_to_wifi = false;
 static EventGroupHandle_t wifi_connected_handle;
 
@@ -37,28 +39,26 @@ void client_run (void* arg) {
 
     struct sockaddr_in server = {
         .sin_family = AF_INET,
-        .sin_port = htons(1234),
+        .sin_port = htons(1234)
     };
-    inet_pton(AF_INET, "192.168.2.101", &server.sin_addr);
+    // addr.sin_addr.s_addr = INADDR_ANY;
+    inet_pton(AF_INET, SERVER_ADDR, &server.sin_addr);
 
     puts("CLIENT SETUP");
 
-    fd_set read_set, error_set, all_set;
+    fd_set all_set;
 
     int client, max_fd;
-    ssize_t bytes;
-    bool connected;
-    char msg[100];
+    bool connected = true;
+    
     struct timeval timeout = {
         .tv_sec = 5,
         .tv_usec = 0
     };
-    struct timeval timeout_select;
     while (true)
     {
-        client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(struct timeval));
-        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(struct timeval));
+        client = create_client((char *)&timeout, sizeof(struct timeval));
+        printf("CLIENT: %d\n", client);
 
         FD_ZERO(&all_set);
         FD_SET(client, &all_set);
@@ -68,63 +68,11 @@ void client_run (void* arg) {
             puts("Couldn't connect");
         }
         else {
-            bytes = send(client, SERVER_KEY, sizeof(char)*(strlen(SERVER_KEY)+1), 0);
-            if (bytes < 0) goto not_connected;
 
-            memset(msg, 0, MSG_BUFFER_SIZE*sizeof(char));
-            bytes = recv(client, msg, sizeof(char)*MSG_BUFFER_SIZE, 0);
-            if (bytes < 0) goto not_connected;
-            puts(msg);
-
-            connected = true;
-            puts("Connected");
-            goto connected;
-
-            not_connected:
-            printf("Can't connect\n");
-            connected = false;
-
-            connected:
+            // connected = authorize_connect(client, SERVER_KEY);
+            
             while(connected) {
-                int amount;
-                timeout_select = (struct timeval) {.tv_sec = 30, .tv_usec = 0};
-                do {
-                    FD_COPY(&all_set, &read_set);
-                    FD_COPY(&all_set, &error_set);
-                    //int is_pressed = !gpio_get_level(BUTTON_PIN);
-
-                    amount = select(max_fd+1, &read_set, NULL, &error_set, &timeout_select);
-                    vTaskDelay(500 / portTICK_PERIOD_MS);
-                } while(amount < 0 && errno == EINTR);
-                if (amount < 0) {
-                    printf("SELECT ERROR errno %d\n %s\n", errno, strerror(errno));
-                    break;
-                }
-                else if (amount == 0) { /* SERVERS PING, CLIENT DO NOT */ puts("timeout"); }
-                else {
-                    for(int i = 0; i < max_fd+1; i++) {
-                        //DISCONNECTS
-                        if (FD_ISSET(i, &error_set)) { puts("ERROR SET"); goto error; }
-                        //READ EITHER SERVER PING OR SENSOR READ
-                        if (FD_ISSET(i, &read_set)) {
-                            if (i == client) {
-                                memset(msg, 0, MSG_BUFFER_SIZE*sizeof(char));
-                                bytes = recv(client, msg, MSG_BUFFER_SIZE*sizeof(char), 0);
-                                if (bytes < 0) {puts("RECV ERROR"); goto error;} //ERROR
-
-                                bytes = strncmp(msg, SERVER_PING, strlen(SERVER_PING));
-                                if(bytes) {puts("SERVER_PING WRONG"); goto error;} //MSG different from ping is also an error
-
-                                bytes = send(client, SERVER_KEY, (strlen(SERVER_KEY)+1)*sizeof(char), 0);
-                                if (bytes < 0) {puts("SEND ERROR"); goto error;}
-                                puts("SERVER PINGED");
-                            }
-                        }
-                    }
-                    goto non_error;
-                    error: break;
-                    non_error:;
-                }
+                handle_connection(client, &all_set, max_fd, SERVER_PING, SERVER_KEY);
             }
         }
         closesocket(client);
@@ -132,26 +80,9 @@ void client_run (void* arg) {
     }
 }
 
-void try_reconnect(void *esp_netif, esp_event_base_t base, int32_t event_id, void *data) {
-    puts("Disconected");
-    ESP_ERROR_CHECK(esp_wifi_connect());
-}
-
 void started_wifi_sta(void *esp_netif, esp_event_base_t base, int32_t event_id, void *data) {
     if (connect_to_wifi)
         esp_wifi_connect();
-}
-
-void connected_wifi_sta(void *nothing, esp_event_base_t base, int32_t event_id, void *data) {
-    //ESP_ERROR_CHECK(esp_netif_dhcpc_stop(my_netif));
-
-    //esp_netif_ip_info_t info;
-    //esp_netif_get_ip_info(my_netif, &info);
-    //esp_netif_set_ip4_addr(&info.ip, 192, 168, 2, 162);
-    //ESP_ERROR_CHECK(esp_netif_set_ip_info(my_netif, &info));
-
-    //ESP_ERROR_CHECK(esp_netif_dhcpc_start(my_netif));
-    //printf("ASKING FOR IP " IPSTR "\n", IP2STR(&info.ip));
 }
 
 #define TARGET_STATIC_IP_OCT 192, 168, 2, 78
@@ -187,26 +118,10 @@ void setup_events() {
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT,
-        WIFI_EVENT_STA_DISCONNECTED,
-        &try_reconnect,
-        NULL,
-        &try_reconnect_instance
-    ));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT,
         WIFI_EVENT_STA_START,
         &started_wifi_sta,
         NULL,
         &started_wifi_sta_instance
-    ));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT,
-        WIFI_EVENT_STA_CONNECTED,
-        &connected_wifi_sta,
-        NULL,
-        &connected_wifi_sta_instance
     ));
 }
 
@@ -280,10 +195,12 @@ void app_main() {
     EventBits_t bits = xEventGroupWaitBits(wifi_connected_handle, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-        client_run(NULL);
+        xTaskCreate(client_run, "Client Run", 4068, NULL, 0, &client_run_handle);
     }
     else {
         puts("Couldn't wait for wifi connection \n Trying to restart ESP32");
         esp_restart();
     }
+
+    while(true) vTaskDelay(10 / portTICK_PERIOD_MS);
 }
